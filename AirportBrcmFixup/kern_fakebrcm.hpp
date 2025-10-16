@@ -8,7 +8,7 @@
 #ifndef FakeBrcm_h
 #define FakeBrcm_h
 
-#include <Library/LegacyIOService.h>
+#include <IOKit/IOService.h>
 #include <Headers/kern_iokit.hpp>
 #include <Headers/kern_util.hpp>
 #include <Headers/kern_config.hpp>
@@ -24,7 +24,6 @@ class EXPORT PCIHookManager
 	static WIOKit::t_PCIConfigRead32    orgConfigRead32;
 
 public:
-	static void setServiceProvider(IOService* provider);
 	static void hookProvider(IOService* provider);
 };
 

@@ -9,7 +9,10 @@
 
 #include "kern_config.hpp"
 #include "kern_fakebrcm.hpp"
+#include <IOKit/IOCatalogue.h>
+
 #include "kern_misc.hpp"
+
 
 OSDefineMetaClassAndStructors(FakeBrcm, IOService);
 
@@ -27,9 +30,9 @@ bool PCIHookManager::isServiceSupported(IORegistryEntry* service)
 	if (service == service_provider)
 		return true;
 	
-	for (int i=0; i<kextListSize; i++)
+	for (int i=0; i<MaxServices; i++)
 	{
-		if (strcmp(serviceNameList[i], service->getName()) == 0)
+		if (strcmp(serviceNameList[i], safeString(service->getName())) == 0)
 			return true;
 	}
 	return false;
@@ -43,7 +46,7 @@ UInt16 PCIHookManager::configRead16(IORegistryEntry *service, UInt32 space, UInt
 	UInt16 newResult = result;
 	
 	if ((offset == WIOKit::PCIRegister::kIOPCIConfigVendorID || offset == WIOKit::PCIRegister::kIOPCIConfigDeviceID) && isServiceSupported(service))
-		switch (offset)
+	switch (offset)
 	{
 		case WIOKit::PCIRegister::kIOPCIConfigVendorID:
 		{
@@ -62,7 +65,7 @@ UInt16 PCIHookManager::configRead16(IORegistryEntry *service, UInt32 space, UInt
 	}
 	
 	if (newResult != result)
-		DBGLOG("BRCMFX", "PCIHookManager::configRead16: name = %s, source value = 0x%04x replaced with value = 0x%04x", service->getName(), result, newResult);
+		DBGLOG("BRCMFX", "PCIHookManager::configRead16: name = %s, source value = 0x%04x replaced with value = 0x%04x", safeString(service->getName()), result, newResult);
 	
 	return newResult;
 }
@@ -85,22 +88,21 @@ UInt32 PCIHookManager::configRead32(IORegistryEntry *service, UInt32 space, UInt
 	}
 	
 	if (newResult != result)
-		DBGLOG("BRCMFX", "PCIHookManager::configRead32: name = %s, source value = 0x%08x replaced with value = 0x%08x", service->getName(), result, newResult);
+		DBGLOG("BRCMFX", "PCIHookManager::configRead32: name = %s, source value = 0x%08x replaced with value = 0x%08x", safeString(service->getName()), result, newResult);
 	
 	return newResult;
 }
 
 //==============================================================================
 
-void PCIHookManager::setServiceProvider(IOService *provider)
-{
-	service_provider = provider;
-}
-
-//==============================================================================
-
 void PCIHookManager::hookProvider(IOService *provider)
 {
+	if (service_provider == nullptr)
+	{
+		ADDPR(brcmfx_config).readArguments(provider);
+	}
+	service_provider = provider;
+
 	UInt32 vendor, device;
 	if (WIOKit::getOSDataValue(provider, "device-id", device) && WIOKit::getOSDataValue(provider, "vendor-id", vendor))
 	{
@@ -111,11 +113,11 @@ void PCIHookManager::hookProvider(IOService *provider)
 			return;
 		}
 	}
-	
+
 	if (orgConfigRead16 == nullptr)
 		if (KernelPatcher::routeVirtual(provider, WIOKit::PCIConfigOffset::ConfigRead16, configRead16, &orgConfigRead16))
 			DBGLOG("BRCMFX", "PCIHookManager::hookProvider for configRead16 was successful");
-	
+
 	if (orgConfigRead32 == nullptr)
 		if (KernelPatcher::routeVirtual(provider, WIOKit::PCIConfigOffset::ConfigRead32, configRead32, &orgConfigRead32))
 			DBGLOG("BRCMFX", "PCIHookManager::hookProvider for configRead32 was successful");
@@ -147,7 +149,6 @@ bool FakeBrcm::init(OSDictionary *propTable)
 
 bool FakeBrcm::attach(IOService *provider)
 {
-	PCIHookManager::setServiceProvider(provider);
 	PCIHookManager::hookProvider(provider);
 	
 	return super::attach(provider);
@@ -157,7 +158,7 @@ bool FakeBrcm::attach(IOService *provider)
 
 IOService* FakeBrcm::probe(IOService * provider, SInt32 *score)
 {
-	DBGLOG("BRCMFX", "FakeBrcm::probe()");
+	DBGLOG("BRCMFX", "FakeBrcm::probe(), version %s", xStringify(MODULE_VERSION));
 
 	if (!ADDPR(startSuccess))
 	{
@@ -170,8 +171,6 @@ IOService* FakeBrcm::probe(IOService * provider, SInt32 *score)
 		SYSLOG("BRCMFX", "FakeBrcm super::probe returned nullptr\n");
 		return nullptr;
 	}
-	
-	*score = -2000;
 
 	if (ADDPR(brcmfx_config).disabled)
 	{
@@ -179,34 +178,51 @@ IOService* FakeBrcm::probe(IOService * provider, SInt32 *score)
 		return ret;
 	}
 	
-	DBGLOG("BRCMFX", "FakeBrcm::probe(): service provider is %s", provider->getName());
+	DBGLOG("BRCMFX", "FakeBrcm::probe(): service provider is %s", safeString(provider->getName()));
 	
-	for (size_t i = 0; i < kextListSize; i++)
+	ADDPR(brcmfx_config).readArguments(provider);
+	
+	for (int i = 0; i < MaxServices; i++)
 	{
-		const OSMetaClass * meta_class = OSMetaClass::getMetaClassWithName(OSSymbol::withCStringNoCopy(serviceNameList[i]));
-		if (meta_class != nullptr)
-		{
-			DBGLOG("BRCMFX", "FakeBrcm::probe(): meta class for %s exists!", serviceNameList[i]);
+		int brcmfx_driver = checkBrcmfxDriverValue(i, true);
+		if (i != brcmfx_driver)
+			continue;
 
-			IOService *service = (IOService *) OSMetaClass::allocClassWithName(serviceNameList[i]);
-			if (service != nullptr)
-			{
-				service->retain();
-				DBGLOG("BRCMFX", "FakeBrcm: retain counter for driver %s is %d", serviceNameList[i], service->getRetainCount());
-				service_found = true;
+		auto bundle = OSSymbol::withCStringNoCopy(idList[i]);
+		if (bundle) {
+			OSDictionary * dict = OSDictionary::withCapacity(1);
+			if (dict) {
+				dict->setObject(kCFBundleIdentifierKey, bundle);
+				SInt32 generation = 0;
+				OSOrderedSet *set = gIOCatalogue->findDrivers(dict, &generation);
+				if (set) {
+					if (set->getCount() > 0)
+					{
+						DBGLOG("BRCMFX", "FakeBrcm::probe(): gIOCatalogue->findDrivers() returned non-empty ordered set for bundle %s", idList[i]);
+						service_found = true;
+						
+					}
+					else
+						DBGLOG("BRCMFX", "FakeBrcm::probe(): gIOCatalogue->findDrivers() returned empty ordered set for bundle %s", idList[i]);
+				}
+				else {
+					SYSLOG("BRCMFX", "FakeBrcm::probe(): gIOCatalogue->findDrivers() failed for bundle %s", idList[i]);
+				}
+				OSSafeReleaseNULL(dict);
+				OSSafeReleaseNULL(set);
 			}
-			else
-				SYSLOG("BRCMFX", "FakeBrcm: instance of driver %s couldn't be created", serviceNameList[i]);
 		}
 	}
 	
 	if (service_found)
 	{
-		DBGLOG("BRCMFX", "FakeBrcm::probe() will change score from %d to 2000", *score);
-		*score = 2000;  // change probe score to be the first in the list
+		SInt32 new_probe_score = 6000;
+		DBGLOG("BRCMFX", "FakeBrcm::probe() will change score from %d to %d", *score, new_probe_score);
+		*score = new_probe_score;  // change probe score to be the first in the list
 	}
 	else
 	{
+		*score = -2000;
 		DBGLOG("BRCMFX", "FakeBrcm::probe(): fallback to original driver");
 	}
 
@@ -221,7 +237,7 @@ bool FakeBrcm::start(IOService *provider)
 
 	if (!ADDPR(startSuccess))
 	{
-		return nullptr;
+		return false;
 	}
 
 	if (ADDPR(brcmfx_config).disabled)
@@ -242,7 +258,6 @@ bool FakeBrcm::start(IOService *provider)
 		return false;
 	}
 	
-	PCIHookManager::setServiceProvider(provider);
 	PCIHookManager::hookProvider(provider);
 
 	return true;
@@ -263,6 +278,3 @@ void FakeBrcm::free()
 	DBGLOG("BRCMFX", "FakeBrcm::free()");
 	super::free();
 }
-
-
-
